@@ -1,0 +1,126 @@
+import os
+import argparse
+import numpy as np
+
+import torch
+import torch_pruning as tp
+
+import models
+
+
+def disassemble():
+    parser = argparse.ArgumentParser(description='Disassemble model into task-aware components')
+    parser.add_argument('--model_name', default='', type=str, help='model name')
+    parser.add_argument('--num_classes', default='', type=int, help='num classes')
+    parser.add_argument('--model_path', default='', type=str, help='model path')
+    parser.add_argument('--save_dir', default='', type=str, help='save dir')
+    parser.add_argument('--mask_dir', default='', type=str, help='mask dir')
+    parser.add_argument('--disa_layers', default='', nargs='+', type=int, help='disa layers')
+    parser.add_argument('--disa_labels', default='', nargs='+', type=int, help='disa labels')
+    parser.add_argument('--model_save_name', default='model_disa.pth', type=str, help='custom save name')
+    args = parser.parse_args()
+
+    # ----------------------------------------
+    print('-' * 50)
+    print('SAVE DIR:', args.save_dir)
+    print('-' * 50)
+
+    # Load model
+    model = models.load_model(args.model_name, num_classes=args.num_classes)
+    model.load_state_dict(torch.load(args.model_path, map_location=torch.device('cpu')))
+
+    modules = models.load_modules(model=model, model_layers=None)
+    named_modules = list(model.named_modules())  # Get names to help identify ResNet blocks
+
+    # Mask setup
+    mask_path = os.path.join(args.mask_dir, 'mask_layer{}.pt')
+    if args.disa_layers[0] == -1:
+        args.disa_layers = [i for i in range(len(modules) - 1)]
+
+    print('Disassembling layers:', args.disa_layers)
+    print('Disassembling labels:', args.disa_labels)
+
+    # Build dependency graph
+    DG = tp.DependencyGraph().build_dependency(model, example_inputs=torch.randn(1, 3, 32, 32))
+
+    # ----------------------------
+    # 1. Input channel pruning
+    # ----------------------------
+    for layer in args.disa_layers:
+        module = modules[layer]
+
+        # Find the module name
+        module_name = None
+        for name, mod in named_modules:
+            if mod is module:
+                module_name = name
+                break
+
+        print(f'===> LAYER {layer} | NAME: {module_name}')
+        print('--->', module)
+
+        # ---- Skip non-conv1/conv2 conv layers in ResNet50 ----
+        if args.model_name.lower() == 'resnet50' and isinstance(module, torch.nn.Conv2d):
+            if not (module_name and any(key in module_name for key in ['conv1', 'conv2'])):
+                print(f"Skipping Conv2d layer '{module_name}' (not in first two layers of block)")
+                continue
+
+        # Load masks
+        mask_total_i = None
+        mask_i = torch.load(mask_path.format(layer))
+        for label in args.disa_labels:
+            if mask_total_i is None:
+                mask_total_i = mask_i[label]
+            else:
+                mask_total_i = torch.bitwise_or(mask_i[label], mask_total_i)
+        idxs = torch.where(mask_total_i == 0)[0].tolist()
+
+        # Determine pruning function
+        prune_fn = None
+        if isinstance(module, torch.nn.Conv2d):
+            prune_fn = tp.prune_conv_in_channels
+        elif isinstance(module, torch.nn.Linear):
+            prune_fn = tp.prune_linear_in_channels
+
+        # Perform pruning
+        if prune_fn is not None:
+            group = DG.get_pruning_group(module, prune_fn, idxs=idxs)
+            if DG.check_pruning_group(group):
+                group.prune()
+        print('--->', module)
+
+    '''
+    # ----------------------------
+    # 2. Output channel pruning
+    # ----------------------------
+    layer = 0  # Usually the final classifier layer
+    print('---> OUTPUT PRUNE:', modules[layer])
+
+    mask_i = torch.load(mask_path.format(-1))
+    mask_total_i = None
+    for label in args.disa_labels:
+        if mask_total_i is None:
+            mask_total_i = mask_i[label]
+        else:
+            mask_total_i = torch.bitwise_or(mask_i[label], mask_total_i)
+    idxs = np.where(mask_total_i == 0)[0].tolist()
+
+    prune_fn = tp.prune_linear_out_channels
+    group = DG.get_pruning_group(modules[layer], prune_fn, idxs=idxs)
+    if DG.check_pruning_group(group):
+        group.prune()
+    print('--->', modules[layer])
+    '''
+
+    # ----------------------------
+    # 3. Save pruned model
+    # ----------------------------
+    model.zero_grad()
+    result_path = os.path.join(args.save_dir, args.model_save_name)
+    torch.save(model, result_path)
+    print('Saved model to:', result_path)
+    print(model)
+
+
+if __name__ == '__main__':
+    disassemble()

@@ -1,6 +1,0 @@
-The mismatch test is designed to test a dissassembled model on several subsets of the same or similar size. 
-
-The main edit was that the previous code required the task to be passed in as a subset. This caused numerous problems. For example, the accuracy of all dissassembled tasks was 0 because all 
-single tasks were mapped to 0. Because of this, we changed the code to test on the entire dataset then calculate the accuracy only on 
-specific classes. 
-These experiments all use models with unpruned final layers 
